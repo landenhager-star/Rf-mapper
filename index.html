@@ -66,7 +66,10 @@
     { id: 'l_band', name: '1.2 - 1.7 GHz L-Band', centerMHz: 1420, range: '1200 - 1700 MHz', baseline: -85 }
   ];
 
-  let map, markersLayer = null, currentPos = null, currentAlt = 0, loggedPoints = [], burstCount = 0;
+  const STORAGE_KEY = 'rf_mapper_survey_data';
+  let map, markersLayer = null, currentPos = null, currentAlt = 0;
+  let loggedPoints = [];
+  let burstCount = 0;
   let gpsWatchId = null;
   let isHardwareLive = false;
   let scannerInterval = null;
@@ -90,46 +93,9 @@
     map = L.map('map').setView([50.1, -96.5], 13);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
     markersLayer = L.layerGroup().addTo(map);
+    restorePersistedData();
   }
 
   function initMeters() {
     const container = document.getElementById('meters');
-    container.innerHTML = BANDS.map(b => `
-      <div class="band-card" id="card-${b.id}">
-        <div class="band-header">
-          <span>
-            ${b.name} <small style="color:#888;">(~${b.centerMHz} MHz)</small>
-            <span class="ping-badge" id="ping-${b.id}">PING DETECTED</span>
-          </span>
-          <span id="val-${b.id}">-85 dBm</span>
-        </div>
-        <div class="bar-bg">
-          <div class="bar-fill" id="bar-${b.id}"></div>
-          <span class="bar-text" id="peak-${b.id}">Hold: -85 dBm</span>
-        </div>
-      </div>
-    `).join('');
-  }
-
-  function toggleGPS() {
-    const btn = document.getElementById('btn-gps');
-    const status = document.getElementById('gps-status');
-
-    if (gpsWatchId) {
-      navigator.geolocation.clearWatch(gpsWatchId);
-      gpsWatchId = null;
-      btn.classList.remove('active');
-      btn.innerText = 'Start GPS';
-      status.innerText = '| GPS: Off';
-      return;
-    }
-
-    if (!navigator.geolocation) { alert('No GPS hardware detected.'); return; }
-
-    gpsWatchId = navigator.geolocation.watchPosition(
-      pos => {
-        currentPos = [pos.coords.latitude, pos.coords.longitude];
-        currentAlt = pos.coords.altitude || 0;
-        status.innerText = `| GPS: ±${Math.round(pos.coords.accuracy)}m`;
-        btn.classList.add('active');
-        btn.
+    container.innerHTML = BANDS.
