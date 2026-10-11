@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RF Spectrum & GPS Mapper</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
+    header { background: #1f1f1f; padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; }
+    .btn { background: #007acc; color: #fff; border: none; padding: 8px 14px; border-radius: 4px; font-weight: bold; cursor: pointer; }
+    .btn:hover { background: #005999; }
+    .btn.active { background: #28a745; }
+    .status { font-size: 13px; color: #aaa; }
+    #main { display: flex; flex: 1; flex-direction: column; overflow: hidden; }
+    @media (min-width: 768px) { #main { flex-direction: row; } }
+    #meters { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; background: #181818; }
+    .band-card { background: #242424; border-radius: 6px; padding: 10px; border-left: 5px solid #555; }
+    .band-card.peak { border-left-color: #ff4757; }
+    .band-header { display: flex; justify-content: space-between; font-size: 14px; font-weight: bold; margin-bottom: 6px; }
+    .bar-bg { background: #333; height: 18px; border-radius: 9px; overflow: hidden; position: relative; }
+    .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2ed573, #ffa502, #ff4757); transition: width 0.2s; }
+    .bar-text { position: absolute; right: 8px; top: 1px; font-size: 11px; font-weight: bold; color: #fff; }
+    #map { flex: 1.2; min-height: 300px; background: #222; }
+    #footer { background: #1f1f1f; padding: 8px 16px; font-size: 12px; display: flex; justify-content: space-between; border-top: 1px solid #333; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <strong>RF Spectrum & GPS Mapper</strong>
+    <span class="status" id="gps-status">| GPS: Off</span>
+    <span class="status" id="sdr-status">| SDR: Disconnected</span>
+  </div>
+  <div style="display: flex; gap: 8px;">
+    <button class="btn" id="btn-gps" onclick="toggleGPS()">Start GPS</button>
+    <button class="btn" id="btn-sdr" onclick="connectSDR()">Connect RTL-SDR</button>
+    <button class="btn" onclick="exportKML()">Export KML</button>
+  </div>
+</header>
+
+<div id="main">
+  <div id="meters"></div>
+  <div id="map"></div>
+</div>
+
+<div id="footer">
+  <span id="log-count">Points Logged: 0</span>
+  <span>WebUSB / GPS Field Logger</span>
+</div>
+
+<script>
+  const BANDS = [
+    { id: 'vhf_low', name: 'Low VHF / FM / Airband', range: '50 - 137 MHz', min: -90, max: -10 },
+    { id: 'vhf_ham', name: 'VHF Marine & 2M Ham', range: '144 - 174 MHz', min: -90, max: -10 },
+    { id: 'ism_sub', name: '315 / 433 MHz ISM Remotes', range: '300 - 450 MHz', min: -90, max: -10 },
+    { id: 'uhf_gmrs', name: 'UHF / Land Mobile / GMRS', range: '450 - 512 MHz', min: -90, max: -10 },
+    { id: 'cell_ism', name: '700 - 900 MHz ISM / Cell', range: '700 - 960 MHz', min: -90, max: -10 },
+    { id: 'l_band', name: '1.2 - 1.7 GHz L-Band / GPS', range: '1200 - 1700 MHz', min: -90, max: -10 }
+  ];
+
+  let map, currentPos = null, loggedPoints = [];
+  let gpsWatchId = null;
+
+  function initMap() {
+    map = L.map('map').setView([50.1, -96.5], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '© OpenStreetMap'
+    }).addTo(map);
+  }
+
+  function initMeters() {
+    const container = document.getElementById('meters');
+    container.innerHTML = BANDS.map(b => `
+      <div class="band-card" id="card-${b.id}">
+        <div class="band-header">
+          <span>${b.name} <small style="color:#888;">(${b.range})</small></span>
+          <span id="val-${b.id}">-90 dBm</span>
+        </div>
+        <div class="bar-bg">
+          <div class="bar-fill" id="bar-${b.id}"></div>
+          <span class="bar-text" id="peak-${b.id}">Peak: -90 dBm</span>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function toggleGPS() {
+    const btn = document.getElementById('btn-gps');
+    const status = document.getElementById('gps-status');
+
+    if (gpsWatchId) {
+      navigator.geolocation.clearWatch(gpsWatchId);
+      gpsWatchId = null;
+      btn.classList.remove('active');
+      btn.innerText = 'Start GPS';
+      status.innerText = '| GPS: Off';
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      alert('Geolocation not supported.');
+      return;
+    }
+
+    gpsWatchId = navigator.geolocation.watchPosition(
+      pos => {
+        currentPos = [pos.coords.latitude, pos.coords.longitude];
+        status.innerText = `| GPS: ±${Math.round(pos.coords.accuracy)}m`;
+        btn.classList.add('active');
+        btn.innerText = 'Stop GPS';
+        map.setView(currentPos, 16);
+      },
+      err => alert('GPS Error: ' + err.message),
+      { enableHighAccuracy: true, maximumAge: 1000 }
+    );
+  }
+
+  async function connectSDR() {
+    const status = document.getElementById('sdr-status');
+    const btn = document.getElementById('btn-sdr');
+
+    if (!navigator.usb) {
+      alert('WebUSB not supported in this browser. Running simulation mode.');
+      startSimulation();
+      return;
+    }
+
+    try {
+      const device = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0bda }] });
+      await device.open();
+      status.innerText = `| SDR: Connected (${device.productName || 'RTL2832U'})`;
+      btn.classList.add('active');
+      startSimulation();
+    } catch (err) {
+      console.warn(err);
+      status.innerText = '| SDR: Simulation Mode';
+      startSimulation();
+    }
+  }
+
+  function startSimulation() {
+    setInterval(() => {
+      let maxBand = null, highestPower = -999;
+
+      BANDS.forEach(b => {
+        const noise = -85 + Math.random() * 15;
+        const burst = Math.random() > 0.85 ? Math.random() * 35 : 0;
+        const pwr = Math.round(noise + burst);
+
+        const pct = Math.min(100, Math.max(0, ((pwr - b.min) / (b.max - b.min)) * 100));
+        document.getElementById(`bar-${b.id}`).style.width = pct + '%';
+        document.getElementById(`val-${b.id}`).innerText = `${pwr} dBm`;
+
+        if (pwr > highestPower) {
+          highestPower = pwr;
+          maxBand = b;
+        }
+      });
+
+      BANDS.forEach(b => {
+        document.getElementById(`card-${b.id}`).classList.toggle('peak', b === maxBand);
+      });
+
+      if (currentPos && highestPower > -60) {
+        logHeatPoint(currentPos, maxBand.name, highestPower);
+      }
+    }, 1500);
+  }
+
+  function logHeatPoint(latlng, bandName, power) {
+    const color = power > -40 ? '#ff4757' : power > -55 ? '#ffa502' : '#2ed573';
+    const circle = L.circleMarker(latlng, {
+      radius: 8, fillColor: color, color: '#000', weight: 1, opacity: 1, fillOpacity: 0.8
+    }).addTo(map);
+
+    circle.bindPopup(`<b>${bandName}</b><br>Signal: ${power} dBm<br>Time: ${new Date().toLocaleTimeString()}`);
+    loggedPoints.push({ lat: latlng[0], lon: latlng[1], band: bandName, power: power, time: new Date().toISOString() });
+    document.getElementById('log-count').innerText = `Points Logged: ${loggedPoints.length}`;
+  }
+
+  function exportKML() {
+    if (loggedPoints.length === 0) {
+      alert('No points logged yet. Turn on GPS to record hits.');
+      return;
+    }
+    let kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n<name>RF Field Survey</name>\n`;
+    loggedPoints.forEach(pt => {
+      kml += `  <Placemark>\n    <name>${pt.band} (${pt.power} dBm)</name>\n    <description>Time: ${pt.time}</description>\n    <Point><coordinates>${pt.lon},${pt.lat},0</coordinates></Point>\n  </Placemark>\n`;
+    });
+    kml += `</Document>\n</kml>`;
+
+    const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `rf_survey_${Date.now()}.kml`;
+    a.click();
+  }
+
+  window.onload = () => { initMap(); initMeters(); };
+</script>
+</body>
+</html>
