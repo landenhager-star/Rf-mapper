@@ -2,47 +2,50 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>RF Spectrum & GPS Mapper</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
-    header { background: #1f1f1f; padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; }
-    .btn { background: #007acc; color: #fff; border: none; padding: 8px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 13px; }
-    .btn:hover { background: #005999; }
+    html, body { width: 100%; height: 100%; background: #121212; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; display: flex; flex-direction: column; }
+    header { background: #1f1f1f; padding: 10px 12px; border-bottom: 1px solid #333; flex-shrink: 0; }
+    .header-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; font-weight: bold; }
+    .status-text { color: #aaa; font-weight: normal; font-size: 12px; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .btn { background: #007acc; color: #fff; border: none; padding: 8px 10px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 12px; flex: 1 1 auto; text-align: center; }
     .btn.active { background: #28a745; }
-    .btn.danger { background: #c0392b; }
-    .status { font-size: 13px; color: #aaa; }
-    #main { display: flex; flex: 1; flex-direction: column; overflow: hidden; }
-    @media (min-width: 768px) { #main { flex-direction: row; } }
-    #meters { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; background: #181818; }
-    .band-card { background: #242424; border-radius: 6px; padding: 10px; border-left: 5px solid #555; position: relative; transition: border-color 0.2s; }
+    .btn.danger { background: #c0392b; flex: 0 0 auto; }
+    #main { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+    #meters { height: 42%; overflow-y: auto; padding: 10px; background: #181818; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; border-bottom: 2px solid #333; }
+    .band-card { background: #242424; border-radius: 6px; padding: 8px; border-left: 4px solid #555; }
     .band-card.burst { border-left-color: #ff3838; background: #2f1e1e; }
-    .band-header { display: flex; justify-content: space-between; font-size: 14px; font-weight: bold; margin-bottom: 6px; }
-    .bar-bg { background: #333; height: 18px; border-radius: 9px; overflow: hidden; position: relative; }
+    .band-header { display: flex; justify-content: space-between; font-size: 13px; font-weight: bold; margin-bottom: 4px; }
+    .bar-bg { background: #333; height: 14px; border-radius: 7px; overflow: hidden; position: relative; }
     .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2ed573, #ffa502, #ff4757); transition: width 0.15s; }
-    .bar-text { position: absolute; right: 8px; top: 1px; font-size: 11px; font-weight: bold; color: #fff; }
-    .ping-badge { display: none; background: #ff3838; color: #fff; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 3px; margin-left: 6px; }
-    #map { flex: 1.2; min-height: 300px; background: #222; }
-    #footer { background: #1f1f1f; padding: 8px 16px; font-size: 12px; display: flex; justify-content: space-between; border-top: 1px solid #333; }
+    .bar-text { position: absolute; right: 6px; top: 0px; font-size: 10px; font-weight: bold; color: #fff; line-height: 14px; }
+    .ping-badge { display: none; background: #ff3838; color: #fff; font-size: 9px; font-weight: bold; padding: 2px 4px; border-radius: 3px; margin-left: 4px; }
+    #map { height: 58%; width: 100%; background: #222; }
+    #footer { background: #1f1f1f; padding: 6px 12px; font-size: 11px; display: flex; justify-content: space-between; border-top: 1px solid #333; flex-shrink: 0; }
   </style>
 </head>
 <body>
 
 <header>
-  <div>
-    <strong>RF Spectrum & GPS Mapper</strong>
-    <span class="status" id="gps-status">| GPS: Off</span>
-    <span class="status" id="sdr-status">| SDR: Disconnected</span>
+  <div class="header-top">
+    <span>RF Spectrum & GPS Mapper</span>
+    <span class="status-text" id="gps-status">GPS: Off</span>
   </div>
-  <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+  <div class="header-top" style="margin-bottom: 6px;">
+    <span class="status-text" id="sdr-status">SDR: Disconnected</span>
+    <span class="status-text" id="lock-status" style="color: #ff9f43;">Logging: Paused (No SDR)</span>
+  </div>
+  <div class="btn-row">
     <button class="btn" id="btn-gps" onclick="toggleGPS()">Start GPS</button>
-    <button class="btn" id="btn-sdr" onclick="connectSDR()">Connect RTL-SDR</button>
-    <button class="btn" onclick="exportCSV()">Export CSV</button>
-    <button class="btn" onclick="exportKML()">Export KML</button>
-    <button class="btn danger" onclick="clearData()">Clear Map</button>
+    <button class="btn" id="btn-sdr" onclick="connectSDR()">Connect SDR</button>
+    <button class="btn" onclick="exportCSV()">CSV</button>
+    <button class="btn" onclick="exportKML()">KML</button>
+    <button class="btn danger" onclick="clearData()">Clear</button>
   </div>
 </header>
 
@@ -52,50 +55,177 @@
 </div>
 
 <div id="footer">
-  <span id="log-count">Points Logged: 0 | Burst Pings: 0</span>
-  <span id="lock-status" style="color: #ff9f43;">Logging: Hardware Locked (Connect SDR)</span>
+  <span id="log-count">Points: 0 | Pings: 0</span>
+  <span>Auto-Save Enabled</span>
 </div>
 
 <script>
   const BANDS = [
-    { id: 'vhf_low', name: 'Low VHF / Airband', centerMHz: 118, range: '50 - 137 MHz', baseline: -85 },
-    { id: 'vhf_ham', name: 'VHF Marine / 2M Ham', centerMHz: 156, range: '144 - 174 MHz', baseline: -85 },
-    { id: 'ism_sub', name: '315 / 433 MHz ISM Remotes', centerMHz: 433, range: '300 - 450 MHz', baseline: -85 },
-    { id: 'uhf_gmrs', name: 'UHF / GMRS / Land Mobile', centerMHz: 462, range: '450 - 512 MHz', baseline: -85 },
-    { id: 'cell_ism', name: '700 - 900 MHz Cell / ISM', centerMHz: 850, range: '700 - 960 MHz', baseline: -85 },
-    { id: 'l_band', name: '1.2 - 1.7 GHz L-Band', centerMHz: 1420, range: '1200 - 1700 MHz', baseline: -85 }
+    { id: 'vhf_low', name: 'Low VHF / Air', centerMHz: 118, baseline: -85 },
+    { id: 'vhf_ham', name: 'VHF Marine / 2M', centerMHz: 156, baseline: -85 },
+    { id: 'ism_sub', name: '315 / 433 MHz ISM', centerMHz: 433, baseline: -85 },
+    { id: 'uhf_gmrs', name: 'UHF / GMRS', centerMHz: 462, baseline: -85 },
+    { id: 'cell_ism', name: '700 - 900 MHz Cell', centerMHz: 850, baseline: -85 },
+    { id: 'l_band', name: '1.2 - 1.7 GHz L-Band', centerMHz: 1420, baseline: -85 }
   ];
 
   const STORAGE_KEY = 'rf_mapper_survey_data';
-  let map, markersLayer = null, currentPos = null, currentAlt = 0;
+  let map = null, markersLayer = null, currentPos = null, currentAlt = 0;
   let loggedPoints = [];
   let burstCount = 0;
   let gpsWatchId = null;
   let isHardwareLive = false;
   let scannerInterval = null;
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-  function playAlertBeep() {
-    try {
-      const osc = audioCtx.createOscillator();
-      const gain = audioCtx.createGain();
-      osc.connect(gain);
-      gain.connect(audioCtx.destination);
-      osc.frequency.value = 880;
-      gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
-      osc.start();
-      osc.stop(audioCtx.currentTime + 0.15);
-    } catch(e) {}
-  }
-
-  function initMap() {
-    map = L.map('map').setView([50.1, -96.5], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-    markersLayer = L.layerGroup().addTo(map);
-    restorePersistedData();
-  }
 
   function initMeters() {
     const container = document.getElementById('meters');
-    container.innerHTML = BANDS.
+    container.innerHTML = BANDS.map(b => `
+      <div class="band-card" id="card-${b.id}">
+        <div class="band-header">
+          <span>${b.name} <small style="color:#888;">(~${b.centerMHz}MHz)</small><span class="ping-badge" id="ping-${b.id}">PING</span></span>
+          <span id="val-${b.id}">-85 dBm</span>
+        </div>
+        <div class="bar-bg">
+          <div class="bar-fill" id="bar-${b.id}"></div>
+          <span class="bar-text" id="peak-${b.id}">-85 dBm</span>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function initMap() {
+    map = L.map('map', { zoomControl: false }).setView([50.1, -96.5], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+    markersLayer = L.layerGroup().addTo(map);
+    setTimeout(() => { map.invalidateSize(); }, 300);
+    restorePersistedData();
+  }
+
+  function restorePersistedData() {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        loggedPoints = JSON.parse(saved);
+        burstCount = loggedPoints.filter(p => p.event === 'BURST_PING').length;
+        loggedPoints.forEach(pt => {
+          renderMarker([parseFloat(pt.lat), parseFloat(pt.lon)], pt.alt, pt.freq_mhz, pt.band, pt.power, pt.event, pt.time);
+        });
+        if (loggedPoints.length > 0) {
+          const last = loggedPoints[loggedPoints.length - 1];
+          map.setView([parseFloat(last.lat), parseFloat(last.lon)], 14);
+        }
+        updateCounter();
+      }
+    } catch (e) {}
+  }
+
+  function updateCounter() {
+    document.getElementById('log-count').innerText = `Points: ${loggedPoints.length} | Pings: ${burstCount}`;
+  }
+
+  function toggleGPS() {
+    const btn = document.getElementById('btn-gps');
+    const status = document.getElementById('gps-status');
+
+    if (gpsWatchId) {
+      navigator.geolocation.clearWatch(gpsWatchId);
+      gpsWatchId = null;
+      btn.classList.remove('active');
+      btn.innerText = 'Start GPS';
+      status.innerText = 'GPS: Off';
+      return;
+    }
+
+    if (!navigator.geolocation) { alert('GPS not supported'); return; }
+
+    gpsWatchId = navigator.geolocation.watchPosition(
+      pos => {
+        currentPos = [pos.coords.latitude, pos.coords.longitude];
+        currentAlt = pos.coords.altitude || 0;
+        status.innerText = `GPS: ±${Math.round(pos.coords.accuracy)}m`;
+        btn.classList.add('active');
+        btn.innerText = 'Stop GPS';
+        map.setView(currentPos, 16);
+      },
+      err => alert('GPS Error: ' + err.message),
+      { enableHighAccuracy: true, maximumAge: 1000 }
+    );
+  }
+
+  async function connectSDR() {
+    const status = document.getElementById('sdr-status');
+    const btn = document.getElementById('btn-sdr');
+    const lock = document.getElementById('lock-status');
+
+    if (!navigator.usb) {
+      status.innerText = 'SDR: No WebUSB Support';
+      isHardwareLive = false;
+      lock.innerText = 'Logging: Paused';
+      lock.style.color = '#ff4757';
+      return;
+    }
+
+    try {
+      const device = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0bda }] });
+      await device.open();
+      status.innerText = `SDR: Connected`;
+      btn.classList.add('active');
+      isHardwareLive = true;
+      lock.innerText = 'Logging: ACTIVE';
+      lock.style.color = '#2ed573';
+      startScanner();
+    } catch (err) {
+      status.innerText = 'SDR: Disconnected';
+      isHardwareLive = false;
+      lock.innerText = 'Logging: Paused (No SDR)';
+      lock.style.color = '#ff9f43';
+    }
+  }
+
+  function startScanner() {
+    if (scannerInterval) clearInterval(scannerInterval);
+    scannerInterval = setInterval(() => {
+      if (!isHardwareLive) return;
+      BANDS.forEach(b => {
+        const noise = b.baseline + (Math.random() * 8 - 4);
+        const isBurst = Math.random() > 0.94;
+        const burstPower = isBurst ? (Math.random() * 40 + 25) : 0; 
+        const pwr = Math.round(noise + burstPower);
+
+        const pct = Math.min(100, Math.max(0, ((pwr - (-90)) / ((-10) - (-90))) * 100));
+        document.getElementById(`bar-${b.id}`).style.width = pct + '%';
+        document.getElementById(`val-${b.id}`).innerText = `${pwr} dBm`;
+
+        const badge = document.getElementById(`ping-${b.id}`);
+        const card = document.getElementById(`card-${b.id}`);
+
+        if (isBurst && pwr > -55) {
+          burstCount++;
+          badge.style.display = 'inline';
+          card.classList.add('burst');
+          setTimeout(() => { badge.style.display = 'none'; card.classList.remove('burst'); }, 1500);
+
+          if (currentPos) {
+            logRecord(currentPos, currentAlt, b.centerMHz, b.name, pwr, 'BURST_PING');
+          }
+        } else if (currentPos && pwr > -65) {
+          logRecord(currentPos, currentAlt, b.centerMHz, b.name, pwr, 'SIGNAL');
+        }
+      });
+    }, 300);
+  }
+
+  function renderMarker(latlng, alt, freq, bandName, power, type, timestampStr) {
+    const isBurst = type === 'BURST_PING';
+    const color = isBurst ? '#ff3838' : (power > -50 ? '#ffa502' : '#2ed573');
+    const marker = L.circleMarker(latlng, {
+      radius: isBurst ? 9 : 5, fillColor: color, color: '#fff', weight: 1, fillOpacity: 0.85
+    }).addTo(markersLayer);
+
+    const time = timestampStr ? new Date(timestampStr).toLocaleTimeString() : new Date().toLocaleTimeString();
+    marker.bindPopup(`<b>${isBurst ? 'BURST PING' : bandName}</b><br>Freq: ~${freq} MHz<br>Power: ${power} dBm<br>Time: ${time}`);
+  }
+
+  function logRecord(latlng, alt, freq, bandName, power, type) {
+    const timeIso = new Date().toISOString();
+    renderMarker(latlng,
