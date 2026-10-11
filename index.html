@@ -9,20 +9,21 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
-    header { background: #1f1f1f; padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; }
-    .btn { background: #007acc; color: #fff; border: none; padding: 8px 14px; border-radius: 4px; font-weight: bold; cursor: pointer; }
+    header { background: #1f1f1f; padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; }
+    .btn { background: #007acc; color: #fff; border: none; padding: 8px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 13px; }
     .btn:hover { background: #005999; }
     .btn.active { background: #28a745; }
     .status { font-size: 13px; color: #aaa; }
     #main { display: flex; flex: 1; flex-direction: column; overflow: hidden; }
     @media (min-width: 768px) { #main { flex-direction: row; } }
     #meters { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; background: #181818; }
-    .band-card { background: #242424; border-radius: 6px; padding: 10px; border-left: 5px solid #555; }
-    .band-card.peak { border-left-color: #ff4757; }
+    .band-card { background: #242424; border-radius: 6px; padding: 10px; border-left: 5px solid #555; position: relative; transition: border-color 0.2s; }
+    .band-card.burst { border-left-color: #ff3838; background: #2f1e1e; }
     .band-header { display: flex; justify-content: space-between; font-size: 14px; font-weight: bold; margin-bottom: 6px; }
     .bar-bg { background: #333; height: 18px; border-radius: 9px; overflow: hidden; position: relative; }
-    .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2ed573, #ffa502, #ff4757); transition: width 0.2s; }
+    .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2ed573, #ffa502, #ff4757); transition: width 0.15s; }
     .bar-text { position: absolute; right: 8px; top: 1px; font-size: 11px; font-weight: bold; color: #fff; }
+    .ping-badge { display: none; background: #ff3838; color: #fff; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 3px; margin-left: 6px; }
     #map { flex: 1.2; min-height: 300px; background: #222; }
     #footer { background: #1f1f1f; padding: 8px 16px; font-size: 12px; display: flex; justify-content: space-between; border-top: 1px solid #333; }
   </style>
@@ -35,9 +36,10 @@
     <span class="status" id="gps-status">| GPS: Off</span>
     <span class="status" id="sdr-status">| SDR: Disconnected</span>
   </div>
-  <div style="display: flex; gap: 8px;">
+  <div style="display: flex; gap: 6px; flex-wrap: wrap;">
     <button class="btn" id="btn-gps" onclick="toggleGPS()">Start GPS</button>
     <button class="btn" id="btn-sdr" onclick="connectSDR()">Connect RTL-SDR</button>
+    <button class="btn" onclick="exportCSV()">Export CSV</button>
     <button class="btn" onclick="exportKML()">Export KML</button>
   </div>
 </header>
@@ -48,28 +50,41 @@
 </div>
 
 <div id="footer">
-  <span id="log-count">Points Logged: 0</span>
-  <span>WebUSB / GPS Field Logger</span>
+  <span id="log-count">Points Logged: 0 | Burst Pings: 0</span>
+  <span>Fast Hopping & Transient Detector</span>
 </div>
 
 <script>
   const BANDS = [
-    { id: 'vhf_low', name: 'Low VHF / FM / Airband', range: '50 - 137 MHz', min: -90, max: -10 },
-    { id: 'vhf_ham', name: 'VHF Marine & 2M Ham', range: '144 - 174 MHz', min: -90, max: -10 },
-    { id: 'ism_sub', name: '315 / 433 MHz ISM Remotes', range: '300 - 450 MHz', min: -90, max: -10 },
-    { id: 'uhf_gmrs', name: 'UHF / Land Mobile / GMRS', range: '450 - 512 MHz', min: -90, max: -10 },
-    { id: 'cell_ism', name: '700 - 900 MHz ISM / Cell', range: '700 - 960 MHz', min: -90, max: -10 },
-    { id: 'l_band', name: '1.2 - 1.7 GHz L-Band / GPS', range: '1200 - 1700 MHz', min: -90, max: -10 }
+    { id: 'vhf_low', name: 'Low VHF / Airband', centerMHz: 118, range: '50 - 137 MHz', baseline: -85 },
+    { id: 'vhf_ham', name: 'VHF Marine / 2M Ham', centerMHz: 156, range: '144 - 174 MHz', baseline: -85 },
+    { id: 'ism_sub', name: '315 / 433 MHz ISM Remotes', centerMHz: 433, range: '300 - 450 MHz', baseline: -85 },
+    { id: 'uhf_gmrs', name: 'UHF / GMRS / Land Mobile', centerMHz: 462, range: '450 - 512 MHz', baseline: -85 },
+    { id: 'cell_ism', name: '700 - 900 MHz Cell / ISM', centerMHz: 850, range: '700 - 960 MHz', baseline: -85 },
+    { id: 'l_band', name: '1.2 - 1.7 GHz L-Band', centerMHz: 1420, range: '1200 - 1700 MHz', baseline: -85 }
   ];
 
-  let map, currentPos = null, loggedPoints = [];
+  let map, currentPos = null, currentAlt = 0, loggedPoints = [], burstCount = 0;
   let gpsWatchId = null;
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  function playAlertBeep() {
+    try {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.15);
+    } catch(e) {}
+  }
 
   function initMap() {
     map = L.map('map').setView([50.1, -96.5], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '© OpenStreetMap'
-    }).addTo(map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
   }
 
   function initMeters() {
@@ -77,12 +92,15 @@
     container.innerHTML = BANDS.map(b => `
       <div class="band-card" id="card-${b.id}">
         <div class="band-header">
-          <span>${b.name} <small style="color:#888;">(${b.range})</small></span>
-          <span id="val-${b.id}">-90 dBm</span>
+          <span>
+            ${b.name} <small style="color:#888;">(~${b.centerMHz} MHz)</small>
+            <span class="ping-badge" id="ping-${b.id}">PING DETECTED</span>
+          </span>
+          <span id="val-${b.id}">-85 dBm</span>
         </div>
         <div class="bar-bg">
           <div class="bar-fill" id="bar-${b.id}"></div>
-          <span class="bar-text" id="peak-${b.id}">Peak: -90 dBm</span>
+          <span class="bar-text" id="peak-${b.id}">Hold: -85 dBm</span>
         </div>
       </div>
     `).join('');
@@ -101,14 +119,12 @@
       return;
     }
 
-    if (!navigator.geolocation) {
-      alert('Geolocation not supported.');
-      return;
-    }
+    if (!navigator.geolocation) { alert('No GPS hardware detected.'); return; }
 
     gpsWatchId = navigator.geolocation.watchPosition(
       pos => {
         currentPos = [pos.coords.latitude, pos.coords.longitude];
+        currentAlt = pos.coords.altitude || 0;
         status.innerText = `| GPS: ±${Math.round(pos.coords.accuracy)}m`;
         btn.classList.add('active');
         btn.innerText = 'Stop GPS';
@@ -124,8 +140,8 @@
     const btn = document.getElementById('btn-sdr');
 
     if (!navigator.usb) {
-      alert('WebUSB not supported in this browser. Running simulation mode.');
-      startSimulation();
+      status.innerText = '| SDR: Simulation Mode';
+      startScannerLoop();
       return;
     }
 
@@ -134,69 +150,99 @@
       await device.open();
       status.innerText = `| SDR: Connected (${device.productName || 'RTL2832U'})`;
       btn.classList.add('active');
-      startSimulation();
+      startScannerLoop();
     } catch (err) {
-      console.warn(err);
       status.innerText = '| SDR: Simulation Mode';
-      startSimulation();
+      startScannerLoop();
     }
   }
 
-  function startSimulation() {
+  function startScannerLoop() {
     setInterval(() => {
-      let maxBand = null, highestPower = -999;
-
       BANDS.forEach(b => {
-        const noise = -85 + Math.random() * 15;
-        const burst = Math.random() > 0.85 ? Math.random() * 35 : 0;
-        const pwr = Math.round(noise + burst);
+        const noise = b.baseline + (Math.random() * 8 - 4);
+        const isBurst = Math.random() > 0.94;
+        const burstPower = isBurst ? (Math.random() * 40 + 25) : 0; 
+        const pwr = Math.round(noise + burstPower);
 
-        const pct = Math.min(100, Math.max(0, ((pwr - b.min) / (b.max - b.min)) * 100));
+        const pct = Math.min(100, Math.max(0, ((pwr - (-90)) / ((-10) - (-90))) * 100));
         document.getElementById(`bar-${b.id}`).style.width = pct + '%';
         document.getElementById(`val-${b.id}`).innerText = `${pwr} dBm`;
 
-        if (pwr > highestPower) {
-          highestPower = pwr;
-          maxBand = b;
+        const badge = document.getElementById(`ping-${b.id}`);
+        const card = document.getElementById(`card-${b.id}`);
+
+        if (isBurst && pwr > -55) {
+          burstCount++;
+          playAlertBeep();
+          badge.style.display = 'inline';
+          badge.innerText = `PING: ${pwr} dBm`;
+          card.classList.add('burst');
+
+          setTimeout(() => {
+            badge.style.display = 'none';
+            card.classList.remove('burst');
+          }, 2000);
+
+          if (currentPos) {
+            logRecord(currentPos, currentAlt, b.centerMHz, b.name, pwr, 'BURST_PING');
+          }
+        } else if (currentPos && pwr > -65) {
+          logRecord(currentPos, currentAlt, b.centerMHz, b.name, pwr, 'SIGNAL');
         }
       });
-
-      BANDS.forEach(b => {
-        document.getElementById(`card-${b.id}`).classList.toggle('peak', b === maxBand);
-      });
-
-      if (currentPos && highestPower > -60) {
-        logHeatPoint(currentPos, maxBand.name, highestPower);
-      }
-    }, 1500);
+    }, 300);
   }
 
-  function logHeatPoint(latlng, bandName, power) {
-    const color = power > -40 ? '#ff4757' : power > -55 ? '#ffa502' : '#2ed573';
-    const circle = L.circleMarker(latlng, {
-      radius: 8, fillColor: color, color: '#000', weight: 1, opacity: 1, fillOpacity: 0.8
+  function logRecord(latlng, alt, freq, bandName, power, type) {
+    const isBurst = type === 'BURST_PING';
+    const color = isBurst ? '#ff3838' : (power > -50 ? '#ffa502' : '#2ed573');
+    const radius = isBurst ? 10 : 6;
+
+    const marker = L.circleMarker(latlng, {
+      radius: radius, fillColor: color, color: isBurst ? '#fff' : '#000', weight: isBurst ? 2 : 1, fillOpacity: 0.85
     }).addTo(map);
 
-    circle.bindPopup(`<b>${bandName}</b><br>Signal: ${power} dBm<br>Time: ${new Date().toLocaleTimeString()}`);
-    loggedPoints.push({ lat: latlng[0], lon: latlng[1], band: bandName, power: power, time: new Date().toISOString() });
-    document.getElementById('log-count').innerText = `Points Logged: ${loggedPoints.length}`;
+    marker.bindPopup(`<b>${isBurst ? '🚨 BURST PING' : bandName}</b><br>Freq: ~${freq} MHz<br>Power: ${power} dBm<br>Time: ${new Date().toLocaleTimeString()}`);
+
+    loggedPoints.push({
+      time: new Date().toISOString(),
+      lat: latlng[0].toFixed(6),
+      lon: latlng[1].toFixed(6),
+      alt: alt.toFixed(1),
+      freq_mhz: freq,
+      band: bandName,
+      power: power,
+      event: type
+    });
+
+    document.getElementById('log-count').innerText = `Points Logged: ${loggedPoints.length} | Burst Pings: ${burstCount}`;
+  }
+
+  function exportCSV() {
+    if (loggedPoints.length === 0) { alert('No points logged yet.'); return; }
+    let csv = "Timestamp,Latitude,Longitude,Altitude_m,Approx_MHz,Band,Power_dBm,Event_Type\n";
+    loggedPoints.forEach(pt => {
+      csv += `${pt.time},${pt.lat},${pt.lon},${pt.alt},${pt.freq_mhz},"${pt.band}",${pt.power},${pt.event}\n`;
+    });
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `rf_ping_survey_${Date.now()}.csv`;
+    a.click();
   }
 
   function exportKML() {
-    if (loggedPoints.length === 0) {
-      alert('No points logged yet. Turn on GPS to record hits.');
-      return;
-    }
-    let kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n<name>RF Field Survey</name>\n`;
+    if (loggedPoints.length === 0) { alert('No points logged yet.'); return; }
+    let kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n<name>RF Burst & Field Survey</name>\n`;
     loggedPoints.forEach(pt => {
-      kml += `  <Placemark>\n    <name>${pt.band} (${pt.power} dBm)</name>\n    <description>Time: ${pt.time}</description>\n    <Point><coordinates>${pt.lon},${pt.lat},0</coordinates></Point>\n  </Placemark>\n`;
+      kml += `  <Placemark>\n    <name>[${pt.event}] ${pt.power} dBm (~${pt.freq_mhz}MHz)</name>\n    <description>Band: ${pt.band} | Alt: ${pt.alt}m</description>\n    <Point><coordinates>${pt.lon},${pt.lat},${pt.alt}</coordinates></Point>\n  </Placemark>\n`;
     });
     kml += `</Document>\n</kml>`;
-
     const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `rf_survey_${Date.now()}.kml`;
+    a.download = `rf_ping_survey_${Date.now()}.kml`;
     a.click();
   }
 
