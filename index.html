@@ -13,6 +13,7 @@
     .btn { background: #007acc; color: #fff; border: none; padding: 8px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 13px; }
     .btn:hover { background: #005999; }
     .btn.active { background: #28a745; }
+    .btn.danger { background: #c0392b; }
     .status { font-size: 13px; color: #aaa; }
     #main { display: flex; flex: 1; flex-direction: column; overflow: hidden; }
     @media (min-width: 768px) { #main { flex-direction: row; } }
@@ -41,6 +42,7 @@
     <button class="btn" id="btn-sdr" onclick="connectSDR()">Connect RTL-SDR</button>
     <button class="btn" onclick="exportCSV()">Export CSV</button>
     <button class="btn" onclick="exportKML()">Export KML</button>
+    <button class="btn danger" onclick="clearData()">Clear Map</button>
   </div>
 </header>
 
@@ -51,7 +53,7 @@
 
 <div id="footer">
   <span id="log-count">Points Logged: 0 | Burst Pings: 0</span>
-  <span>Fast Hopping & Transient Detector</span>
+  <span id="lock-status" style="color: #ff9f43;">Logging: Hardware Locked (Connect SDR)</span>
 </div>
 
 <script>
@@ -64,8 +66,10 @@
     { id: 'l_band', name: '1.2 - 1.7 GHz L-Band', centerMHz: 1420, range: '1200 - 1700 MHz', baseline: -85 }
   ];
 
-  let map, currentPos = null, currentAlt = 0, loggedPoints = [], burstCount = 0;
+  let map, markersLayer = null, currentPos = null, currentAlt = 0, loggedPoints = [], burstCount = 0;
   let gpsWatchId = null;
+  let isHardwareLive = false;
+  let scannerInterval = null;
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
   function playAlertBeep() {
@@ -85,6 +89,7 @@
   function initMap() {
     map = L.map('map').setView([50.1, -96.5], 13);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+    markersLayer = L.layerGroup().addTo(map);
   }
 
   function initMeters() {
@@ -127,126 +132,4 @@
         currentAlt = pos.coords.altitude || 0;
         status.innerText = `| GPS: ±${Math.round(pos.coords.accuracy)}m`;
         btn.classList.add('active');
-        btn.innerText = 'Stop GPS';
-        map.setView(currentPos, 16);
-      },
-      err => alert('GPS Error: ' + err.message),
-      { enableHighAccuracy: true, maximumAge: 1000 }
-    );
-  }
-
-  async function connectSDR() {
-    const status = document.getElementById('sdr-status');
-    const btn = document.getElementById('btn-sdr');
-
-    if (!navigator.usb) {
-      status.innerText = '| SDR: Simulation Mode';
-      startScannerLoop();
-      return;
-    }
-
-    try {
-      const device = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0bda }] });
-      await device.open();
-      status.innerText = `| SDR: Connected (${device.productName || 'RTL2832U'})`;
-      btn.classList.add('active');
-      startScannerLoop();
-    } catch (err) {
-      status.innerText = '| SDR: Simulation Mode';
-      startScannerLoop();
-    }
-  }
-
-  function startScannerLoop() {
-    setInterval(() => {
-      BANDS.forEach(b => {
-        const noise = b.baseline + (Math.random() * 8 - 4);
-        const isBurst = Math.random() > 0.94;
-        const burstPower = isBurst ? (Math.random() * 40 + 25) : 0; 
-        const pwr = Math.round(noise + burstPower);
-
-        const pct = Math.min(100, Math.max(0, ((pwr - (-90)) / ((-10) - (-90))) * 100));
-        document.getElementById(`bar-${b.id}`).style.width = pct + '%';
-        document.getElementById(`val-${b.id}`).innerText = `${pwr} dBm`;
-
-        const badge = document.getElementById(`ping-${b.id}`);
-        const card = document.getElementById(`card-${b.id}`);
-
-        if (isBurst && pwr > -55) {
-          burstCount++;
-          playAlertBeep();
-          badge.style.display = 'inline';
-          badge.innerText = `PING: ${pwr} dBm`;
-          card.classList.add('burst');
-
-          setTimeout(() => {
-            badge.style.display = 'none';
-            card.classList.remove('burst');
-          }, 2000);
-
-          if (currentPos) {
-            logRecord(currentPos, currentAlt, b.centerMHz, b.name, pwr, 'BURST_PING');
-          }
-        } else if (currentPos && pwr > -65) {
-          logRecord(currentPos, currentAlt, b.centerMHz, b.name, pwr, 'SIGNAL');
-        }
-      });
-    }, 300);
-  }
-
-  function logRecord(latlng, alt, freq, bandName, power, type) {
-    const isBurst = type === 'BURST_PING';
-    const color = isBurst ? '#ff3838' : (power > -50 ? '#ffa502' : '#2ed573');
-    const radius = isBurst ? 10 : 6;
-
-    const marker = L.circleMarker(latlng, {
-      radius: radius, fillColor: color, color: isBurst ? '#fff' : '#000', weight: isBurst ? 2 : 1, fillOpacity: 0.85
-    }).addTo(map);
-
-    marker.bindPopup(`<b>${isBurst ? '🚨 BURST PING' : bandName}</b><br>Freq: ~${freq} MHz<br>Power: ${power} dBm<br>Time: ${new Date().toLocaleTimeString()}`);
-
-    loggedPoints.push({
-      time: new Date().toISOString(),
-      lat: latlng[0].toFixed(6),
-      lon: latlng[1].toFixed(6),
-      alt: alt.toFixed(1),
-      freq_mhz: freq,
-      band: bandName,
-      power: power,
-      event: type
-    });
-
-    document.getElementById('log-count').innerText = `Points Logged: ${loggedPoints.length} | Burst Pings: ${burstCount}`;
-  }
-
-  function exportCSV() {
-    if (loggedPoints.length === 0) { alert('No points logged yet.'); return; }
-    let csv = "Timestamp,Latitude,Longitude,Altitude_m,Approx_MHz,Band,Power_dBm,Event_Type\n";
-    loggedPoints.forEach(pt => {
-      csv += `${pt.time},${pt.lat},${pt.lon},${pt.alt},${pt.freq_mhz},"${pt.band}",${pt.power},${pt.event}\n`;
-    });
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `rf_ping_survey_${Date.now()}.csv`;
-    a.click();
-  }
-
-  function exportKML() {
-    if (loggedPoints.length === 0) { alert('No points logged yet.'); return; }
-    let kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n<name>RF Burst & Field Survey</name>\n`;
-    loggedPoints.forEach(pt => {
-      kml += `  <Placemark>\n    <name>[${pt.event}] ${pt.power} dBm (~${pt.freq_mhz}MHz)</name>\n    <description>Band: ${pt.band} | Alt: ${pt.alt}m</description>\n    <Point><coordinates>${pt.lon},${pt.lat},${pt.alt}</coordinates></Point>\n  </Placemark>\n`;
-    });
-    kml += `</Document>\n</kml>`;
-    const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `rf_ping_survey_${Date.now()}.kml`;
-    a.click();
-  }
-
-  window.onload = () => { initMap(); initMeters(); };
-</script>
-</body>
-</html>
+        btn.
