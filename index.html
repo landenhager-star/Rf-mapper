@@ -17,6 +17,13 @@
     .btn.danger { background: #c0392b; flex: 0.7; }
     .opt-row { display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 11px; }
     .opt-row select { background: #2a2a2a; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; padding: 4px; font-size: 11px; }
+    #bg-warn { display: none; background: #7a1f1f; color: #fff; font-size: 11px; padding: 4px 6px; border-radius: 4px; margin-top: 6px; }
+    .track-row { display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 11px; }
+    .track-row input { width: 84px; background: #2a2a2a; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; padding: 5px; font-size: 12px; }
+    .track-row .btn { flex: none; padding: 7px 10px; }
+    #track-box { display: none; margin-top: 6px; background: #1b2a1b; border: 1px solid #2ed573; border-radius: 6px; padding: 6px 8px; }
+    #track-big { font-size: 20px; font-weight: bold; }
+    #track-sub { font-size: 11px; color: #aaa; margin-top: 2px; }
     #meters { height: 40vh; overflow-y: auto; padding: 8px; background: #181818; display: flex; flex-direction: column; gap: 6px; border-bottom: 2px solid #333; flex-shrink: 0; }
     .band-card { background: #242424; border-radius: 4px; padding: 6px 8px; border-left: 4px solid #555; }
     .band-card.sig { border-left-color: #ffa502; }
@@ -42,6 +49,7 @@
     <span id="sdr-status" style="color:#aaa;">SDR: Disconnected</span>
     <span id="lock-status" style="color:#ff9f43;">Logging: Paused (No SDR)</span>
   </div>
+  <div id="bg-warn"></div>
   <div class="btn-row">
     <button class="btn" id="btn-gps" onclick="toggleGPS()">Start GPS</button>
     <button class="btn" id="btn-sdr" onclick="connectSDR()">Connect SDR</button>
@@ -58,8 +66,20 @@
       <option value="40">40 dB</option>
       <option value="49.6">49.6 dB</option>
     </select>
-    <button class="btn" id="btn-sweeps" style="flex:none;padding:5px 8px;" onclick="toggleSweepLog()">Log all sweeps: Off</button>
-    <span style="color:#888;">Fixed gain is best for comparing spots</span>
+    <button class="btn active" id="btn-sweeps" style="flex:none;padding:5px 8px;" onclick="toggleSweepLog()">Log all readings: On</button>
+    <span style="color:#888;">Keep gain fixed between spots</span>
+  </div>
+  <div class="track-row">
+    <label for="track-freq">Track MHz</label>
+    <input id="track-freq" type="number" step="0.001" min="30" max="1700" value="431.500" list="track-presets">
+    <datalist id="track-presets"><option value="431.500"><option value="440.175"><option value="313.850"><option value="302.757"><option value="868.350"><option value="434.176"><option value="849.900"><option value="118.725"><option value="462.5625"></datalist>
+    <button class="btn" id="btn-track" onclick="toggleTrack()">Track</button>
+    <button class="btn" id="btn-sound" onclick="toggleSound()">Sound: On</button>
+  </div>
+  <div id="track-box">
+    <div id="track-big">--</div>
+    <div id="track-sub">--</div>
+    <div class="bar-bg" style="margin-top:6px;"><div class="bar-fill" id="track-bar"></div></div>
   </div>
 </header>
 
@@ -146,16 +166,52 @@
     const noiseDb = sorted[sorted.length >> 1];                  // median = noise floor
     return { peakDb, peakHz: centerHz + peakOff, noiseDb, snr: peakDb - noiseDb, frames };
   }
+  // Narrow look at one frequency. targetHz must be inside the window and away from the DC spike.
+  function analyzeTarget(u8, fs, centerHz, targetHz, halfBwHz) {
+    const frames = Math.floor(u8.length / 2 / FFT_N);
+    if (frames < 1) return null;
+    const acc = new Float64Array(FFT_N);
+    for (let f = 0; f < frames; f++) {
+      const base = f * FFT_N * 2;
+      for (let i = 0; i < FFT_N; i++) {
+        reBuf[i] = ((u8[base + 2 * i] - 127.5) / 127.5) * hann[i];
+        imBuf[i] = ((u8[base + 2 * i + 1] - 127.5) / 127.5) * hann[i];
+      }
+      fftFn(reBuf, imBuf);
+      for (let k = 0; k < FFT_N; k++) acc[k] += reBuf[k] * reBuf[k] + imBuf[k] * imBuf[k];
+    }
+    const norm = frames * winSum * winSum;
+    const binHz = fs / FFT_N;
+    const usable = [];
+    let tDb = -Infinity, tHz = targetHz;
+    for (let k = 0; k < FFT_N; k++) {
+      const off = (k < FFT_N / 2 ? k : k - FFT_N) * binHz;
+      const a = Math.abs(off);
+      if (a < DC_EXCLUDE_HZ || a > USABLE_HZ) continue;
+      const db = 10 * Math.log10(acc[k] / norm + 1e-20);
+      usable.push(db);
+      const hz = centerHz + off;
+      if (Math.abs(hz - targetHz) <= halfBwHz && db > tDb) { tDb = db; tHz = hz; }
+    }
+    const sorted = Float64Array.from(usable).sort();
+    const noiseDb = sorted[sorted.length >> 1];
+    return { tDb, tHz, noiseDb, snr: tDb - noiseDb };
+  }
   // DSP-END
 
   /* ================= App ================= */
   const BANDS = [
-    { id: 'vhf_low',  name: 'Low VHF / Air',        centerMHz: 118 },
-    { id: 'vhf_ham',  name: 'VHF Marine / 2M',      centerMHz: 156 },
-    { id: 'ism_sub',  name: '315 / 433 MHz ISM',    centerMHz: 433 },
-    { id: 'uhf_gmrs', name: 'UHF / GMRS',           centerMHz: 462 },
-    { id: 'cell_ism', name: '700 - 900 MHz Cell',   centerMHz: 850 },
-    { id: 'l_band',   name: '1.2 - 1.7 GHz L-Band', centerMHz: 1420 }
+    { id: 'vhf_low',  name: 'Low VHF / Air',         centerMHz: 118 },
+    { id: 'vhf_ham',  name: 'VHF Marine / 2M',       centerMHz: 156 },
+    { id: 'f_303',    name: '302-304 MHz',           centerMHz: 303 },
+    { id: 'f_314',    name: '313-315 MHz',           centerMHz: 314.2 },
+    { id: 'f_4315',   name: '431.5 MHz',             centerMHz: 431.8 },
+    { id: 'f_434',    name: '433.9 / 434 MHz ISM',   centerMHz: 434 },
+    { id: 'f_440',    name: '440 MHz',               centerMHz: 440 },
+    { id: 'uhf_gmrs', name: 'UHF / GMRS',            centerMHz: 462 },
+    { id: 'cell_ism', name: '700 - 900 MHz Cell',    centerMHz: 850 },
+    { id: 'f_868',    name: '868 MHz SRD',           centerMHz: 868 },
+    { id: 'l_band',   name: '1.2 - 1.7 GHz L-Band',  centerMHz: 1420 }
   ];
 
   const SIGNAL_SNR = 10;   // dB above the noise floor => SIGNAL
@@ -168,8 +224,11 @@
   let loggedPoints = [];
   let burstCount = 0, sweepCount = 0;
   let gpsWatchId = null;
-  let isHardwareLive = false, scanning = false, logSweeps = false;
+  let isHardwareLive = false, scanning = false, logSweeps = true;
   let sdr = null, RtlSdrLib = null, libLoading = null, gainUsed = 'auto';
+  let trackHz = null, tunedKey = null, soundOn = true, audioCtx = null;
+  let recentSnr = [], bestAvg = -Infinity, bestMarker = null, peakHold = -Infinity, lastTrackLog = 0;
+  let saveTimer = null;
 
   const halfSpan = (FS / 2) / 1e6;
   const container = document.getElementById('meters');
@@ -217,7 +276,7 @@
 
   function toggleSweepLog() {
     logSweeps = !logSweeps;
-    document.getElementById('btn-sweeps').innerText = `Log all sweeps: ${logSweeps ? 'On' : 'Off'}`;
+    document.getElementById('btn-sweeps').innerText = `Log all readings: ${logSweeps ? 'On' : 'Off'}`;
     document.getElementById('btn-sweeps').classList.toggle('active', logSweeps);
   }
 
@@ -307,6 +366,7 @@
       isHardwareLive = true;
       btn.classList.add('active'); btn.innerText = 'Disconnect';
       setSdrStatus('SDR: Connected', '#2ed573');
+      requestWake();
       setLock(currentPos ? 'Logging: ACTIVE' : 'Scanning (start GPS to log)', currentPos ? '#2ed573' : '#ff9f43');
       scanLoop();
     } catch (err) {
@@ -318,7 +378,7 @@
   }
 
   async function stopSDR(msg) {
-    scanning = false; isHardwareLive = false;
+    scanning = false; isHardwareLive = false; releaseWake();
     const btn = document.getElementById('btn-sdr');
     btn.classList.remove('active'); btn.innerText = 'Connect SDR';
     try { if (sdr && typeof sdr.close === 'function') await sdr.close(); } catch (e) {}
@@ -329,13 +389,40 @@
 
   if (navigator.usb) navigator.usb.addEventListener('disconnect', () => { if (isHardwareLive) stopSDR('SDR: Unplugged'); });
 
+  /* ---- Keep the screen awake and warn if the page goes to the background ---- */
+  let wakeLock = null, hiddenAt = null;
+  async function requestWake() {
+    try {
+      if ('wakeLock' in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      }
+    } catch (e) {}
+  }
+  function releaseWake() { try { if (wakeLock) wakeLock.release(); } catch (e) {} wakeLock = null; }
+  function showWarn(t) {
+    const b = document.getElementById('bg-warn');
+    b.innerText = t; b.style.display = 'block';
+    setTimeout(() => { b.style.display = 'none'; }, 20000);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { if (isHardwareLive) hiddenAt = Date.now(); return; }
+    if (isHardwareLive) requestWake();
+    if (hiddenAt) {
+      const secs = Math.round((Date.now() - hiddenAt) / 1000); hiddenAt = null;
+      if (secs >= 2) showWarn(`Page was in the background for ${secs}s - nothing was logged then. Keep this page on screen.`);
+    }
+  });
+
   /* ---- Real scanner: tune each band, grab IQ, FFT, report ---- */
   async function scanLoop() {
     scanning = true;
     try {
       while (scanning && sdr) {
+        if (trackHz) { await trackStep(); continue; }
+        tunedKey = null;
         for (const b of BANDS) {
-          if (!scanning) break;
+          if (!scanning || trackHz) break;
           await sdr.setCenterFrequency(b.centerMHz * 1e6);
           await sdr.resetBuffer();
           await sdr.readSamples(SETTLE_SAMPLES);                       // discard retune transient
@@ -375,9 +462,11 @@
   function renderMarker(latlng, pt) {
     if (!markersLayer) return;
     const snr = parseFloat(pt.snr);
-    const color = pt.event === 'BURST_PING' ? '#ff3838' : (pt.event === 'SIGNAL' ? '#ffa502' : '#2ed573');
+    const color = pt.event === 'TRACK'
+      ? (snr >= 20 ? '#ff3838' : snr >= 10 ? '#ffa502' : snr >= 3 ? '#2ed573' : '#5b7083')
+      : (pt.event === 'BURST_PING' ? '#ff3838' : (pt.event === 'SIGNAL' ? '#ffa502' : '#2ed573'));
     const marker = L.circleMarker(latlng, {
-      radius: pt.event === 'BURST_PING' ? 9 : (pt.event === 'SIGNAL' ? 6 : 3),
+      radius: pt.event === 'BURST_PING' ? 9 : (pt.event === 'SIGNAL' ? 6 : (pt.event === 'TRACK' ? 5 : 3)),
       fillColor: color, color: '#fff', weight: 1, fillOpacity: 0.85
     }).addTo(markersLayer);
     const time = new Date(pt.time).toLocaleTimeString();
@@ -397,9 +486,86 @@
     loggedPoints.push(pt);
     if (type === 'BURST_PING') burstCount++;
     renderMarker(currentPos, pt);
+    scheduleSave();
+    updateCounter();
+  }
+
+  function flushSave() {
+    saveTimer = null;
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(loggedPoints)); }
     catch (e) { if (!window._quotaWarned) { window._quotaWarned = true; alert('Browser storage is full. Export the CSV and tap Clear.'); } }
-    updateCounter();
+  }
+  function scheduleSave() { if (!saveTimer) saveTimer = setTimeout(flushSave, 2000); }
+  window.addEventListener('pagehide', flushSave);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) flushSave(); });
+
+  /* ---- Track mode: lock onto one frequency, live readout + sound + best-spot marker ---- */
+  function toggleSound() {
+    soundOn = !soundOn;
+    document.getElementById('btn-sound').innerText = `Sound: ${soundOn ? 'On' : 'Off'}`;
+  }
+
+  function beep(snr) {
+    if (!soundOn || !audioCtx || snr < 3) return;
+    try {
+      const t = audioCtx.currentTime, o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = 300 + Math.min(snr, 40) * 35;
+      g.gain.setValueAtTime(0.15, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+      o.connect(g); g.connect(audioCtx.destination); o.start(t); o.stop(t + 0.09);
+    } catch (e) {}
+  }
+
+  function toggleTrack() {
+    const btn = document.getElementById('btn-track'), box = document.getElementById('track-box');
+    if (trackHz) {
+      trackHz = null; tunedKey = null;
+      btn.innerText = 'Track'; btn.classList.remove('active'); box.style.display = 'none';
+      return;
+    }
+    if (!isHardwareLive) { alert('Connect the SDR first.'); return; }
+    const f = parseFloat(document.getElementById('track-freq').value);
+    if (!(f >= 30 && f <= 1700)) { alert('Enter a frequency between 30 and 1700 MHz.'); return; }
+    try { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) {}
+    recentSnr = []; bestAvg = -Infinity; peakHold = -Infinity; tunedKey = null;
+    if (bestMarker && markersLayer) { markersLayer.removeLayer(bestMarker); bestMarker = null; }
+    trackHz = f * 1e6;
+    btn.innerText = 'Stop track'; btn.classList.add('active'); box.style.display = 'block';
+    document.getElementById('track-big').innerText = 'Tuning...';
+  }
+
+  async function trackStep() {
+    const target = trackHz, center = target - 300e3;   // target sits 300 kHz off centre, clear of the DC spike
+    if (tunedKey !== center) { await sdr.setCenterFrequency(center); tunedKey = center; }
+    await sdr.resetBuffer();
+    await sdr.readSamples(4096);
+    const buf = await sdr.readSamples(FFT_N * 8);
+    if (trackHz !== target) return;
+    const r = analyzeTarget(new Uint8Array(buf), FS, center, target, 12000);
+    if (r) handleTrack(r, target);
+  }
+
+  function handleTrack(r, target) {
+    peakHold = Math.max(peakHold, r.snr);
+    recentSnr.push(r.snr); if (recentSnr.length > 3) recentSnr.shift();
+    const avg = recentSnr.reduce((a, b) => a + b, 0) / recentSnr.length;
+    const f = (target / 1e6).toFixed(3);
+    const sign = r.snr >= 0 ? '+' : '';
+    document.getElementById('track-big').innerText = `${f} MHz   ${sign}${r.snr.toFixed(1)} dB`;
+    document.getElementById('track-sub').innerText = `level ${r.tDb.toFixed(1)} dBFS | floor ${r.noiseDb.toFixed(1)} | peak seen at ${(r.tHz / 1e6).toFixed(4)} MHz | max so far +${peakHold.toFixed(1)} dB`;
+    document.getElementById('track-bar').style.width = Math.min(100, Math.max(0, (r.snr / 40) * 100)) + '%';
+    beep(r.snr);
+    if (!currentPos) return;
+    const now = Date.now();
+    if (logSweeps && now - lastTrackLog >= (r.snr >= 6 ? 100 : 500)) {
+      lastTrackLog = now;
+      logRecord({ centerMHz: target / 1e6, name: 'TRACK ' + f }, { peakHz: r.tHz, peakDb: r.tDb, noiseDb: r.noiseDb, snr: r.snr }, 'TRACK');
+    }
+    if (recentSnr.length === 3 && avg > bestAvg && map && markersLayer) {
+      bestAvg = avg;
+      if (bestMarker) markersLayer.removeLayer(bestMarker);
+      bestMarker = L.circleMarker(currentPos, { radius: 13, fillColor: '#ff3838', color: '#fff', weight: 3, fillOpacity: 0.35 }).addTo(markersLayer);
+      bestMarker.bindPopup(`<b>Strongest so far</b><br>${f} MHz<br>+${avg.toFixed(1)} dB (avg of 3)`);
+    }
   }
 
   function clearData() {
