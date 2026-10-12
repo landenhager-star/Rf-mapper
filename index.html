@@ -20,3 +20,423 @@
     #meters { height: 40vh; overflow-y: auto; padding: 8px; background: #181818; display: flex; flex-direction: column; gap: 6px; border-bottom: 2px solid #333; flex-shrink: 0; }
     .band-card { background: #242424; border-radius: 4px; padding: 6px 8px; border-left: 4px solid #555; }
     .band-card.sig { border-left-color: #ffa502; }
+    .band-card.burst { border-left-color: #ff3838; background: #2f1e1e; }
+    .band-header { display: flex; justify-content: space-between; font-size: 12px; font-weight: bold; margin-bottom: 4px; }
+    .band-sub { font-size: 10px; color: #888; font-weight: normal; }
+    .bar-bg { background: #333; height: 14px; border-radius: 7px; overflow: hidden; position: relative; }
+    .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2ed573, #ffa502, #ff4757); transition: width 0.15s; }
+    .bar-text { position: absolute; right: 6px; top: 0px; font-size: 10px; font-weight: bold; color: #fff; line-height: 14px; }
+    .ping-badge { display: none; background: #ff3838; color: #fff; font-size: 9px; padding: 1px 4px; border-radius: 3px; margin-left: 4px; }
+    #map { height: 45vh; width: 100%; background: #222; }
+    footer { background: #1f1f1f; padding: 6px 10px; font-size: 11px; display: flex; justify-content: space-between; border-top: 1px solid #333; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-line">
+    <strong>RF Spectrum & GPS Mapper</strong>
+    <span id="gps-status" style="color:#aaa;">GPS: Off</span>
+  </div>
+  <div class="header-line">
+    <span id="sdr-status" style="color:#aaa;">SDR: Disconnected</span>
+    <span id="lock-status" style="color:#ff9f43;">Logging: Paused (No SDR)</span>
+  </div>
+  <div class="btn-row">
+    <button class="btn" id="btn-gps" onclick="toggleGPS()">Start GPS</button>
+    <button class="btn" id="btn-sdr" onclick="connectSDR()">Connect SDR</button>
+    <button class="btn" onclick="exportCSV()">CSV</button>
+    <button class="btn" onclick="exportKML()">KML</button>
+    <button class="btn danger" onclick="clearData()">Clear</button>
+  </div>
+  <div class="opt-row">
+    <label for="gain-sel">Gain</label>
+    <select id="gain-sel">
+      <option value="auto">Auto</option>
+      <option value="20">20 dB</option>
+      <option value="30" selected>30 dB</option>
+      <option value="40">40 dB</option>
+      <option value="49.6">49.6 dB</option>
+    </select>
+    <button class="btn" id="btn-sweeps" style="flex:none;padding:5px 8px;" onclick="toggleSweepLog()">Log all sweeps: Off</button>
+    <span style="color:#888;">Fixed gain is best for comparing spots</span>
+  </div>
+</header>
+
+<div id="meters"></div>
+<div id="map"></div>
+
+<footer>
+  <span id="log-count">Points: 0 | Pings: 0</span>
+  <span id="sweep-info" style="color:#aaa;">Sweeps: 0</span>
+</footer>
+
+<script>
+  /* ================= DSP (no hardware needed, unit-testable) ================= */
+  // DSP-START
+  const FS = 2048000;          // sample rate, Hz
+  const FFT_N = 4096;          // FFT size  -> 500 Hz bins
+  const DC_EXCLUDE_HZ = 25000; // ignore RTL-SDR centre-frequency DC spike
+  const USABLE_HZ = 870000;    // ignore filter roll-off at the band edges
+
+  function makeFFT(n) {
+    const cosT = new Float64Array(n / 2), sinT = new Float64Array(n / 2);
+    for (let i = 0; i < n / 2; i++) { cosT[i] = Math.cos(2 * Math.PI * i / n); sinT[i] = Math.sin(2 * Math.PI * i / n); }
+    const bits = Math.round(Math.log2(n));
+    const rev = new Uint32Array(n);
+    for (let i = 0; i < n; i++) {
+      let x = i, r = 0;
+      for (let b = 0; b < bits; b++) { r = (r << 1) | (x & 1); x >>= 1; }
+      rev[i] = r;
+    }
+    return function (re, im) {
+      for (let i = 0; i < n; i++) {
+        const j = rev[i];
+        if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+      }
+      for (let size = 2; size <= n; size *= 2) {
+        const half = size / 2, step = n / size;
+        for (let i = 0; i < n; i += size) {
+          for (let j = i, k = 0; j < i + half; j++, k += step) {
+            const l = j + half;
+            const tr = re[l] * cosT[k] + im[l] * sinT[k];
+            const ti = -re[l] * sinT[k] + im[l] * cosT[k];
+            re[l] = re[j] - tr; im[l] = im[j] - ti;
+            re[j] += tr; im[j] += ti;
+          }
+        }
+      }
+    };
+  }
+
+  const fftFn = makeFFT(FFT_N);
+  const hann = new Float64Array(FFT_N);
+  let winSum = 0;
+  for (let i = 0; i < FFT_N; i++) { hann[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (FFT_N - 1)); winSum += hann[i]; }
+  const reBuf = new Float64Array(FFT_N), imBuf = new Float64Array(FFT_N);
+
+  // u8: interleaved unsigned-8-bit IQ from the RTL-SDR. Returns levels in dBFS
+  // (0 dBFS = a full-scale complex tone), NOT calibrated dBm.
+  function analyzeIQ(u8, fs, centerHz) {
+    const frames = Math.floor(u8.length / 2 / FFT_N);
+    if (frames < 1) return null;
+    const acc = new Float64Array(FFT_N);
+    for (let f = 0; f < frames; f++) {
+      const base = f * FFT_N * 2;
+      for (let i = 0; i < FFT_N; i++) {
+        reBuf[i] = ((u8[base + 2 * i] - 127.5) / 127.5) * hann[i];
+        imBuf[i] = ((u8[base + 2 * i + 1] - 127.5) / 127.5) * hann[i];
+      }
+      fftFn(reBuf, imBuf);
+      for (let k = 0; k < FFT_N; k++) acc[k] += reBuf[k] * reBuf[k] + imBuf[k] * imBuf[k];
+    }
+    const norm = frames * winSum * winSum;
+    const binHz = fs / FFT_N;
+    const usable = [];
+    let peakDb = -Infinity, peakOff = 0;
+    for (let k = 0; k < FFT_N; k++) {
+      const off = (k < FFT_N / 2 ? k : k - FFT_N) * binHz;      // offset from centre, Hz
+      const a = Math.abs(off);
+      if (a < DC_EXCLUDE_HZ || a > USABLE_HZ) continue;
+      const db = 10 * Math.log10(acc[k] / norm + 1e-20);
+      usable.push(db);
+      if (db > peakDb) { peakDb = db; peakOff = off; }
+    }
+    const sorted = Float64Array.from(usable).sort();
+    const noiseDb = sorted[sorted.length >> 1];                  // median = noise floor
+    return { peakDb, peakHz: centerHz + peakOff, noiseDb, snr: peakDb - noiseDb, frames };
+  }
+  // DSP-END
+
+  /* ================= App ================= */
+  const BANDS = [
+    { id: 'vhf_low',  name: 'Low VHF / Air',        centerMHz: 118 },
+    { id: 'vhf_ham',  name: 'VHF Marine / 2M',      centerMHz: 156 },
+    { id: 'ism_sub',  name: '315 / 433 MHz ISM',    centerMHz: 433 },
+    { id: 'uhf_gmrs', name: 'UHF / GMRS',           centerMHz: 462 },
+    { id: 'cell_ism', name: '700 - 900 MHz Cell',   centerMHz: 850 },
+    { id: 'l_band',   name: '1.2 - 1.7 GHz L-Band', centerMHz: 1420 }
+  ];
+
+  const SIGNAL_SNR = 10;   // dB above the noise floor => SIGNAL
+  const BURST_SNR = 25;    // dB above the noise floor => BURST_PING
+  const SETTLE_SAMPLES = 16384;
+  const READ_SAMPLES = FFT_N * 32;
+
+  const STORAGE_KEY = 'rf_mapper_survey_v2';   // new key: old data held simulated values
+  let map = null, markersLayer = null, currentPos = null, currentAlt = 0, currentAcc = 0;
+  let loggedPoints = [];
+  let burstCount = 0, sweepCount = 0;
+  let gpsWatchId = null;
+  let isHardwareLive = false, scanning = false, logSweeps = false;
+  let sdr = null, RtlSdrLib = null, libLoading = null, gainUsed = 'auto';
+
+  const halfSpan = (FS / 2) / 1e6;
+  const container = document.getElementById('meters');
+  container.innerHTML = BANDS.map(b => `
+    <div class="band-card" id="card-${b.id}">
+      <div class="band-header">
+        <span>${b.name} <span class="band-sub">${(b.centerMHz - halfSpan).toFixed(1)}–${(b.centerMHz + halfSpan).toFixed(1)} MHz</span><span class="ping-badge" id="ping-${b.id}">PING</span></span>
+        <span id="val-${b.id}">--</span>
+      </div>
+      <div class="bar-bg">
+        <div class="bar-fill" id="bar-${b.id}"></div>
+        <span class="bar-text" id="peak-${b.id}">no data</span>
+      </div>
+    </div>`).join('');
+
+  function safeInitMap() {
+    try {
+      map = L.map('map', { zoomControl: false }).setView([50.1, -96.5], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+      markersLayer = L.layerGroup().addTo(map);
+      setTimeout(() => { if (map) map.invalidateSize(); }, 400);
+      restorePersistedData();
+    } catch (err) { console.error('Map init issue:', err); }
+  }
+
+  function restorePersistedData() {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (!saved) return;
+      loggedPoints = JSON.parse(saved);
+      burstCount = loggedPoints.filter(p => p.event === 'BURST_PING').length;
+      loggedPoints.forEach(pt => renderMarker([parseFloat(pt.lat), parseFloat(pt.lon)], pt));
+      if (loggedPoints.length > 0 && map) {
+        const last = loggedPoints[loggedPoints.length - 1];
+        map.setView([parseFloat(last.lat), parseFloat(last.lon)], 14);
+      }
+      updateCounter();
+    } catch (e) {}
+  }
+
+  function updateCounter() {
+    document.getElementById('log-count').innerText = `Points: ${loggedPoints.length} | Pings: ${burstCount}`;
+    document.getElementById('sweep-info').innerText = `Sweeps: ${sweepCount}`;
+  }
+
+  function toggleSweepLog() {
+    logSweeps = !logSweeps;
+    document.getElementById('btn-sweeps').innerText = `Log all sweeps: ${logSweeps ? 'On' : 'Off'}`;
+    document.getElementById('btn-sweeps').classList.toggle('active', logSweeps);
+  }
+
+  function toggleGPS() {
+    const btn = document.getElementById('btn-gps');
+    const status = document.getElementById('gps-status');
+    if (gpsWatchId) {
+      navigator.geolocation.clearWatch(gpsWatchId);
+      gpsWatchId = null; currentPos = null;
+      btn.classList.remove('active'); btn.innerText = 'Start GPS'; status.innerText = 'GPS: Off';
+      return;
+    }
+    if (!navigator.geolocation) { alert('GPS not supported'); return; }
+    gpsWatchId = navigator.geolocation.watchPosition(
+      pos => {
+        currentPos = [pos.coords.latitude, pos.coords.longitude];
+        currentAlt = pos.coords.altitude || 0;
+        currentAcc = pos.coords.accuracy || 0;
+        status.innerText = `GPS: ±${Math.round(currentAcc)}m`;
+        btn.classList.add('active'); btn.innerText = 'Stop GPS';
+        if (map) map.setView(currentPos, 16);
+      },
+      err => alert('GPS Error: ' + err.message),
+      { enableHighAccuracy: true, maximumAge: 1000 }
+    );
+  }
+
+  /* ---- RTL-SDR driver loading (WebUSB library, loaded in the background) ---- */
+  function loadRtlSdrLib() {
+    if (RtlSdrLib) return Promise.resolve(RtlSdrLib);
+    if (libLoading) return libLoading;
+    const pick = m => {
+      const cands = [m, m && m.default, m && m.RtlSdr, m && m.default && m.default.RtlSdr];
+      return cands.find(c => c && typeof c.requestDevice === 'function') || null;
+    };
+    libLoading = (async () => {
+      if (window.RtlSdr && typeof window.RtlSdr.requestDevice === 'function') return (RtlSdrLib = window.RtlSdr);
+      const urls = [
+        'https://esm.sh/rtlsdrjs@0.0.0?target=es2020',
+        'https://cdn.jsdelivr.net/npm/rtlsdrjs@0.0.0/+esm',
+        'https://esm.sh/@sdr.cool/rtlsdrjs@0.1.0?target=es2020'
+      ];
+      for (const u of urls) {
+        try { const lib = pick(await import(u)); if (lib) return (RtlSdrLib = lib); }
+        catch (e) { console.warn('SDR library load failed:', u, e); }
+      }
+      return null;
+    })();
+    libLoading.then(lib => {
+      if (!isHardwareLive) setSdrStatus(lib ? 'SDR: Driver ready' : 'SDR: Driver failed to load', lib ? '#aaa' : '#ff6b6b');
+      if (!lib) libLoading = null;
+    });
+    return libLoading;
+  }
+
+  function setSdrStatus(text, color) {
+    const s = document.getElementById('sdr-status');
+    s.innerText = text; s.style.color = color || '#aaa';
+  }
+  function setLock(text, color) {
+    const l = document.getElementById('lock-status');
+    l.innerText = text; l.style.color = color;
+  }
+
+  async function connectSDR() {
+    const btn = document.getElementById('btn-sdr');
+    if (isHardwareLive) { await stopSDR('SDR: Disconnected'); return; }
+    if (!navigator.usb) {
+      alert('WebUSB requires Google Chrome on Android (or desktop Chrome/Edge). Samsung Internet does not support direct USB dongles.');
+      return;
+    }
+    if (!RtlSdrLib) {
+      setSdrStatus('SDR: Loading driver...', '#ff9f43');
+      const lib = await loadRtlSdrLib();
+      if (!lib) { alert('Could not load the RTL-SDR driver library (check your internet connection once, or tell me and I will inline it).'); return; }
+      alert('Driver loaded. Tap Connect SDR again to pick the dongle.');  // USB prompt needs a fresh tap
+      return;
+    }
+    try {
+      sdr = await RtlSdrLib.requestDevice();
+      const g = document.getElementById('gain-sel').value;
+      gainUsed = g;
+      const opts = {};
+      if (g !== 'auto') opts.gain = parseFloat(g);
+      await sdr.open(opts);
+      await sdr.setSampleRate(FS);
+      isHardwareLive = true;
+      btn.classList.add('active'); btn.innerText = 'Disconnect';
+      setSdrStatus('SDR: Connected', '#2ed573');
+      setLock(currentPos ? 'Logging: ACTIVE' : 'Scanning (start GPS to log)', currentPos ? '#2ed573' : '#ff9f43');
+      scanLoop();
+    } catch (err) {
+      console.error(err);
+      sdr = null; isHardwareLive = false;
+      setSdrStatus('SDR: ' + (err && err.message ? err.message : 'Disconnected'), '#ff6b6b');
+      setLock('Logging: Paused (No SDR)', '#ff9f43');
+    }
+  }
+
+  async function stopSDR(msg) {
+    scanning = false; isHardwareLive = false;
+    const btn = document.getElementById('btn-sdr');
+    btn.classList.remove('active'); btn.innerText = 'Connect SDR';
+    try { if (sdr && typeof sdr.close === 'function') await sdr.close(); } catch (e) {}
+    sdr = null;
+    setSdrStatus(msg || 'SDR: Disconnected', '#aaa');
+    setLock('Logging: Paused (No SDR)', '#ff9f43');
+  }
+
+  if (navigator.usb) navigator.usb.addEventListener('disconnect', () => { if (isHardwareLive) stopSDR('SDR: Unplugged'); });
+
+  /* ---- Real scanner: tune each band, grab IQ, FFT, report ---- */
+  async function scanLoop() {
+    scanning = true;
+    try {
+      while (scanning && sdr) {
+        for (const b of BANDS) {
+          if (!scanning) break;
+          await sdr.setCenterFrequency(b.centerMHz * 1e6);
+          await sdr.resetBuffer();
+          await sdr.readSamples(SETTLE_SAMPLES);                       // discard retune transient
+          const buf = await sdr.readSamples(READ_SAMPLES);
+          const r = analyzeIQ(new Uint8Array(buf), FS, b.centerMHz * 1e6);
+          if (r) handleResult(b, r);
+        }
+        sweepCount++; updateCounter();
+        setLock(currentPos ? 'Logging: ACTIVE' : 'Scanning (start GPS to log)', currentPos ? '#2ed573' : '#ff9f43');
+      }
+    } catch (err) {
+      console.error(err);
+      if (scanning) await stopSDR('SDR error: ' + (err && err.message ? err.message : err));
+    }
+  }
+
+  function handleResult(b, r) {
+    const pct = Math.min(100, Math.max(0, (r.snr / 40) * 100));
+    document.getElementById(`bar-${b.id}`).style.width = pct + '%';
+    document.getElementById(`val-${b.id}`).innerText = `${(r.peakHz / 1e6).toFixed(3)} MHz  ${r.peakDb.toFixed(1)} dBFS`;
+    document.getElementById(`peak-${b.id}`).innerText = `+${r.snr.toFixed(1)} dB over floor (${r.noiseDb.toFixed(1)})`;
+
+    let ev = null;
+    if (r.snr >= BURST_SNR) ev = 'BURST_PING';
+    else if (r.snr >= SIGNAL_SNR) ev = 'SIGNAL';
+
+    const card = document.getElementById(`card-${b.id}`), badge = document.getElementById(`ping-${b.id}`);
+    card.classList.toggle('sig', ev === 'SIGNAL');
+    card.classList.toggle('burst', ev === 'BURST_PING');
+    badge.style.display = ev === 'BURST_PING' ? 'inline' : 'none';
+
+    if (!currentPos) return;
+    if (ev) logRecord(b, r, ev);
+    else if (logSweeps) logRecord(b, r, 'SWEEP');
+  }
+
+  function renderMarker(latlng, pt) {
+    if (!markersLayer) return;
+    const snr = parseFloat(pt.snr);
+    const color = pt.event === 'BURST_PING' ? '#ff3838' : (pt.event === 'SIGNAL' ? '#ffa502' : '#2ed573');
+    const marker = L.circleMarker(latlng, {
+      radius: pt.event === 'BURST_PING' ? 9 : (pt.event === 'SIGNAL' ? 6 : 3),
+      fillColor: color, color: '#fff', weight: 1, fillOpacity: 0.85
+    }).addTo(markersLayer);
+    const time = new Date(pt.time).toLocaleTimeString();
+    marker.bindPopup(`<b>${pt.event}</b> ${pt.band}<br>Peak: ${pt.peak_mhz} MHz<br>Level: ${pt.peak_db} dBFS (floor ${pt.noise_db})<br>SNR: ${snr.toFixed(1)} dB<br>Gain: ${pt.gain}<br>Time: ${time}`);
+  }
+
+  function logRecord(b, r, type) {
+    const pt = {
+      time: new Date().toISOString(),
+      lat: currentPos[0].toFixed(6), lon: currentPos[1].toFixed(6),
+      alt: currentAlt.toFixed(1), acc: currentAcc.toFixed(0),
+      center_mhz: b.centerMHz, band: b.name,
+      peak_mhz: (r.peakHz / 1e6).toFixed(4), peak_db: r.peakDb.toFixed(1),
+      noise_db: r.noiseDb.toFixed(1), snr: r.snr.toFixed(1),
+      gain: gainUsed, event: type
+    };
+    loggedPoints.push(pt);
+    if (type === 'BURST_PING') burstCount++;
+    renderMarker(currentPos, pt);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(loggedPoints)); }
+    catch (e) { if (!window._quotaWarned) { window._quotaWarned = true; alert('Browser storage is full. Export the CSV and tap Clear.'); } }
+    updateCounter();
+  }
+
+  function clearData() {
+    if (confirm('Clear all saved data and map markers?')) {
+      loggedPoints = []; burstCount = 0; sweepCount = 0;
+      localStorage.removeItem(STORAGE_KEY);
+      if (markersLayer) markersLayer.clearLayers();
+      updateCounter();
+    }
+  }
+
+  function download(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  }
+
+  function exportCSV() {
+    if (loggedPoints.length === 0) { alert('No points logged yet.'); return; }
+    let csv = 'Timestamp,Latitude,Longitude,Altitude_m,GPS_Accuracy_m,Center_MHz,Band,Peak_MHz,Peak_dBFS,Noise_dBFS,SNR_dB,Gain_dB,Event_Type\n';
+    loggedPoints.forEach(p => {
+      csv += `${p.time},${p.lat},${p.lon},${p.alt},${p.acc},${p.center_mhz},"${p.band}",${p.peak_mhz},${p.peak_db},${p.noise_db},${p.snr},${p.gain},${p.event}\n`;
+    });
+    download(new Blob([csv], { type: 'text/csv;charset=utf-8;' }), `rf_survey_${Date.now()}.csv`);
+  }
+
+  function exportKML() {
+    if (loggedPoints.length === 0) { alert('No points logged yet.'); return; }
+    let kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n<name>RF Survey</name>\n`;
+    loggedPoints.forEach(p => {
+      kml += `  <Placemark><name>[${p.event}] ${p.peak_mhz} MHz ${p.peak_db} dBFS (+${p.snr} dB)</name><description>Band: ${p.band}; floor ${p.noise_db} dBFS; gain ${p.gain}; time ${p.time}</description><Point><coordinates>${p.lon},${p.lat},${p.alt}</coordinates></Point></Placemark>\n`;
+    });
+    kml += `</Document>\n</kml>`;
+    download(new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' }), `rf_survey_${Date.now()}.kml`);
+  }
+
+  setTimeout(safeInitMap, 100);
+  loadRtlSdrLib();   // start fetching the driver in the background so the Connect tap can open the USB prompt immediately
+</script>
+</body>
+</html>
